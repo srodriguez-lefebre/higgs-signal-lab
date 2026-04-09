@@ -1,2 +1,7 @@
 AGENTS.md
 .codex
+
+data/
+keys/
+results/
+models/
