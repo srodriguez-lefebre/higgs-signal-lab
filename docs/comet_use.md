@@ -2,7 +2,7 @@ from comet_ml import Experiment
 
 # 1. Crear el experimento (una vez por modelo)
 experiment = Experiment(
-    project_name="Primer Proyecto TAA",       
+    project_name="proyecto-1-taa",       
     workspace="equipo-a"
 )
 

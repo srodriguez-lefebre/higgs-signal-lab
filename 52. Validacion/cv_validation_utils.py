@@ -1,0 +1,328 @@
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from comet_ml import Experiment
+from sklearn.base import clone
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+
+
+SEED = 42
+N_SPLITS = 5
+COMET_PROJECT_NAME = "proyecto-1-taa"
+COMET_WORKSPACE = "equipo-a"
+
+PIPELINE_DIRS = {
+    "P01": "P01_jet_onehot_standard",
+    "P02": "P02_jet_onehot_robust",
+    "P04": "P04_feature_engineering_robust",
+}
+
+
+def find_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "roadmap.md").exists() and (candidate / "data").is_dir():
+            return candidate
+    raise FileNotFoundError("No se pudo localizar la raiz del proyecto.")
+
+
+def read_comet_api_key(project_root: Path | None = None) -> str:
+    root = find_project_root(project_root)
+    api_key = (root / "keys" / ".comet.config").read_text().strip()
+    if not api_key:
+        raise ValueError("La API key de Comet esta vacia.")
+    return api_key
+
+
+def load_processed_full_dataset(pipeline_id: str, project_root: Path | None = None) -> dict[str, object]:
+    if pipeline_id not in PIPELINE_DIRS:
+        raise ValueError(f"Pipeline no soportado para CV: {pipeline_id}")
+    root = find_project_root(project_root)
+    dataset_dir = root / "data" / "preprocesor" / PIPELINE_DIRS[pipeline_id]
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"No existe el dataset procesado: {dataset_dir}")
+
+    X_train = pd.read_csv(dataset_dir / "X_train_processed.csv").astype(np.float32)
+    X_valid = pd.read_csv(dataset_dir / "X_valid_processed.csv").astype(np.float32)
+    y_train = pd.read_csv(dataset_dir / "y_train.csv")["Label"].astype(np.int8)
+    y_valid = pd.read_csv(dataset_dir / "y_valid.csv")["Label"].astype(np.int8)
+    w_train = pd.read_csv(dataset_dir / "train_weight.csv")["Weight"].astype(np.float64)
+    w_valid = pd.read_csv(dataset_dir / "valid_weight.csv")["Weight"].astype(np.float64)
+    event_train = pd.read_csv(dataset_dir / "train_event_id.csv")["EventId"].astype(np.int64)
+    event_valid = pd.read_csv(dataset_dir / "valid_event_id.csv")["EventId"].astype(np.int64)
+
+    return {
+        "pipeline_id": pipeline_id,
+        "dataset_dir": dataset_dir,
+        "X": pd.concat([X_train, X_valid], ignore_index=True),
+        "y": pd.concat([y_train, y_valid], ignore_index=True),
+        "weight": pd.concat([w_train, w_valid], ignore_index=True),
+        "event_id": pd.concat([event_train, event_valid], ignore_index=True),
+    }
+
+
+def ams_score(signal_weight: np.ndarray | float, background_weight: np.ndarray | float, br: float = 10.0) -> np.ndarray:
+    signal_arr = np.asarray(signal_weight, dtype=np.float64)
+    background_arr = np.asarray(background_weight, dtype=np.float64)
+    radicand = 2.0 * (
+        (signal_arr + background_arr + br) * np.log1p(signal_arr / (background_arr + br)) - signal_arr
+    )
+    return np.sqrt(np.clip(radicand, a_min=0.0, a_max=None))
+
+
+def find_best_ams_threshold(
+    y_true: pd.Series | np.ndarray,
+    y_scores: np.ndarray,
+    weights: pd.Series | np.ndarray,
+) -> dict[str, float | int]:
+    y_array = np.asarray(y_true, dtype=np.int8)
+    score_array = np.asarray(y_scores, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
+
+    order = np.argsort(score_array)[::-1]
+    y_sorted = y_array[order]
+    score_sorted = score_array[order]
+    weight_sorted = weight_array[order]
+
+    signal_cumsum = np.cumsum(np.where(y_sorted == 1, weight_sorted, 0.0))
+    background_cumsum = np.cumsum(np.where(y_sorted == 0, weight_sorted, 0.0))
+    candidate_mask = np.r_[score_sorted[1:] != score_sorted[:-1], True]
+    candidate_indices = np.flatnonzero(candidate_mask)
+    ams_values = ams_score(signal_cumsum[candidate_indices], background_cumsum[candidate_indices])
+
+    best_position = int(np.argmax(ams_values))
+    best_idx = int(candidate_indices[best_position])
+    threshold = float(score_sorted[best_idx])
+    y_pred = (score_array >= threshold).astype(np.int8)
+
+    return {
+        "best_ams": float(ams_values[best_position]),
+        "best_threshold": threshold,
+        "signal_weight": float(signal_cumsum[best_idx]),
+        "background_weight": float(background_cumsum[best_idx]),
+        "predicted_signal_count": int(y_pred.sum()),
+        "predicted_background_count": int(len(y_pred) - y_pred.sum()),
+        "signal_rate": float(y_pred.mean()),
+        "accuracy_at_ams": float(accuracy_score(y_array, y_pred)),
+        "precision_at_ams": float(precision_score(y_array, y_pred, zero_division=0)),
+        "recall_at_ams": float(recall_score(y_array, y_pred, zero_division=0)),
+        "f1_at_ams": float(f1_score(y_array, y_pred, zero_division=0)),
+    }
+
+
+def predict_scores(model: object, X_valid: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X_valid)[:, 1]
+    if hasattr(model, "decision_function"):
+        raw_scores = model.decision_function(X_valid)
+        return 1.0 / (1.0 + np.exp(-raw_scores))
+    raise TypeError(f"El modelo {type(model).__name__} no expone predict_proba ni decision_function.")
+
+
+def make_experiment(
+    *,
+    api_key: str,
+    folder_name: str,
+    candidate_name: str,
+    pipeline_id: str,
+    model_name: str,
+    fold: int,
+) -> Experiment:
+    experiment = Experiment(
+        api_key=api_key,
+        project_name=COMET_PROJECT_NAME,
+        workspace=COMET_WORKSPACE,
+        auto_param_logging=False,
+        auto_metric_logging=False,
+        log_code=False,
+        log_graph=False,
+        parse_args=False,
+    )
+    experiment.set_name(f"{folder_name}_{candidate_name}_{pipeline_id}_{model_name}_fold_{fold}")
+    experiment.add_tag(folder_name)
+    experiment.add_tag(candidate_name)
+    experiment.add_tag(pipeline_id)
+    experiment.add_tag(model_name)
+    experiment.add_tag("cross_validation")
+    experiment.add_tag("ams")
+    return experiment
+
+
+def summarize_folds(fold_df: pd.DataFrame) -> dict[str, float | int]:
+    return {
+        "fold_count": int(len(fold_df)),
+        "ams_mean": float(fold_df["best_ams"].mean()),
+        "ams_std": float(fold_df["best_ams"].std(ddof=1)),
+        "auc_mean": float(fold_df["roc_auc"].mean()),
+        "auc_std": float(fold_df["roc_auc"].std(ddof=1)),
+        "threshold_mean": float(fold_df["best_threshold"].mean()),
+        "threshold_median": float(fold_df["best_threshold"].median()),
+        "threshold_std": float(fold_df["best_threshold"].std(ddof=1)),
+        "fit_seconds_mean": float(fold_df["fit_seconds"].mean()),
+        "signal_rate_mean": float(fold_df["signal_rate"].mean()),
+        "precision_at_ams_mean": float(fold_df["precision_at_ams"].mean()),
+        "recall_at_ams_mean": float(fold_df["recall_at_ams"].mean()),
+        "f1_at_ams_mean": float(fold_df["f1_at_ams"].mean()),
+    }
+
+
+def run_cv_validation(
+    *,
+    candidate_name: str,
+    pipeline_id: str,
+    model_name: str,
+    model: object,
+    model_params: dict[str, object],
+    folder_name: str = "52. Validacion",
+    n_splits: int = N_SPLITS,
+    seed: int = SEED,
+    log_to_comet: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    project_root = find_project_root()
+    results_dir = project_root / folder_name / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    dataset = load_processed_full_dataset(pipeline_id, project_root)
+    X = dataset["X"]
+    y = dataset["y"]
+    weights = dataset["weight"]
+    event_id = dataset["event_id"]
+    api_key = read_comet_api_key(project_root) if log_to_comet else ""
+
+    fold_rows: list[dict[str, object]] = []
+    oof_parts: list[pd.DataFrame] = []
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    for fold, (train_idx, valid_idx) in enumerate(cv.split(X, y), start=1):
+        fold_model = clone(model)
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        X_valid = X.iloc[valid_idx].reset_index(drop=True)
+        y_train = y.iloc[train_idx].reset_index(drop=True)
+        y_valid = y.iloc[valid_idx].reset_index(drop=True)
+        w_valid = weights.iloc[valid_idx].reset_index(drop=True)
+
+        start = time.perf_counter()
+        fold_model.fit(X_train, y_train)
+        fit_seconds = time.perf_counter() - start
+        valid_scores = predict_scores(fold_model, X_valid)
+
+        ams_metrics = find_best_ams_threshold(y_valid, valid_scores, w_valid)
+        metrics = {
+            **ams_metrics,
+            "roc_auc": float(roc_auc_score(y_valid, valid_scores)),
+            "fit_seconds": float(fit_seconds),
+        }
+        row = {
+            "candidate": candidate_name,
+            "pipeline": pipeline_id,
+            "model": model_name,
+            "fold": int(fold),
+            "seed": int(seed),
+            "uses_processed_dataset_only": True,
+            "preprocessing_modified": False,
+            "weight_used_as_feature": False,
+            "hyperparameters_json": json.dumps(model_params, sort_keys=True),
+            "feature_count": int(X.shape[1]),
+            "train_rows": int(len(train_idx)),
+            "valid_rows": int(len(valid_idx)),
+            **metrics,
+        }
+        fold_rows.append(row)
+        oof_parts.append(
+            pd.DataFrame(
+                {
+                    "EventId": event_id.iloc[valid_idx].to_numpy(dtype=np.int64),
+                    "y_true": y.iloc[valid_idx].to_numpy(dtype=np.int8),
+                    "weight": weights.iloc[valid_idx].to_numpy(dtype=np.float64),
+                    "score": valid_scores,
+                    "fold": int(fold),
+                }
+            )
+        )
+
+        if log_to_comet:
+            experiment = make_experiment(
+                api_key=api_key,
+                folder_name=folder_name,
+                candidate_name=candidate_name,
+                pipeline_id=pipeline_id,
+                model_name=model_name,
+                fold=fold,
+            )
+            try:
+                experiment.log_parameters(model_params)
+                experiment.log_parameters(
+                    {
+                        "candidate": candidate_name,
+                        "pipeline": pipeline_id,
+                        "model": model_name,
+                        "fold": fold,
+                        "seed": seed,
+                        "n_splits": n_splits,
+                        "uses_processed_dataset_only": True,
+                        "preprocessing_modified": False,
+                        "weight_used_as_feature": False,
+                        "dataset_dir": str(dataset["dataset_dir"]),
+                        "feature_count": int(X.shape[1]),
+                        "train_rows": int(len(train_idx)),
+                        "valid_rows": int(len(valid_idx)),
+                    }
+                )
+                experiment.log_metrics(metrics)
+                experiment.log_metric("ams", metrics["best_ams"])
+                experiment.log_metric("best_ams", metrics["best_ams"])
+                experiment.log_metric("ams_threshold", metrics["best_threshold"])
+            finally:
+                experiment.end()
+
+        print(
+            f"fold={fold} AMS={metrics['best_ams']:.6f} "
+            f"AUC={metrics['roc_auc']:.6f} threshold={metrics['best_threshold']:.6f} "
+            f"signal_rate={metrics['signal_rate']:.4f} fit_seconds={fit_seconds:.2f}"
+        )
+
+    fold_df = pd.DataFrame(fold_rows)
+    oof_df = pd.concat(oof_parts, ignore_index=True)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "candidate": candidate_name,
+                "pipeline": pipeline_id,
+                "model": model_name,
+                "seed": int(seed),
+                **summarize_folds(fold_df),
+            }
+        ]
+    )
+    summary_df = summary_df[
+        [
+            "candidate",
+            "pipeline",
+            "model",
+            "seed",
+            "fold_count",
+            "ams_mean",
+            "ams_std",
+            "auc_mean",
+            "auc_std",
+            "threshold_mean",
+            "threshold_median",
+            "threshold_std",
+            "fit_seconds_mean",
+            "signal_rate_mean",
+            "precision_at_ams_mean",
+            "recall_at_ams_mean",
+            "f1_at_ams_mean",
+        ]
+    ]
+
+    safe_name = f"{candidate_name}_{pipeline_id}_{model_name}".replace(" ", "_").replace(".", "")
+    fold_df.to_csv(results_dir / f"{safe_name}_fold_metrics.csv", index=False)
+    oof_df.to_csv(results_dir / f"{safe_name}_oof_scores.csv", index=False)
+    summary_df.to_csv(results_dir / f"{safe_name}_summary.csv", index=False)
+    return fold_df, oof_df, summary_df
