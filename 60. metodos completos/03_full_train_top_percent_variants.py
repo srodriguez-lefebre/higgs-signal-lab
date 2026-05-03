@@ -13,7 +13,7 @@ from final_methods_utils import (
 )
 
 
-TOP_PERCENT_VARIANTS = [13.5, 14.5, 13.0, 15.0]
+TOP_PERCENT_VARIANTS = [15.25, 15.50, 15.75, 16.00]
 
 
 def latest_full_train_scores_path(output_dir: Path) -> Path:
