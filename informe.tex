@@ -65,7 +65,7 @@ Las variables del dataset se dividen principalmente en dos grupos. Las variables
 Dentro de estas variables, \texttt{PRI\_jet\_num} resultó especialmente importante. Esta variable toma los valores 0, 1, 2 y 3, donde el valor 3 representa eventos con tres o más jets. No se trata de una magnitud continua, sino de una categoría que separa regímenes físicos distintos. Además, como se observó en la sección anterior, condiciona directamente qué variables pueden estar definidas. Por este motivo, en los preprocesamientos posteriores se decidió tratarla como variable categórica y no como una variable numérica ordinaria.
 
 \subsection{Conclusiones para el preprocesamiento}
-El análisis dio lugar a varias decisiones de preprocesamiento. En primer lugar, \texttt{EventId}, \texttt{Weight} y \texttt{Label} deben mantenerse fuera de la matriz de entrada \texttt{X}. En segundo lugar, el valor \texttt{-999} debe reemplazarse por \texttt{NaN} antes de aplicar transformaciones. Y que no conviene eliminar columnas por tener muchos faltantes, ya que estos contienen información estructural sobre el evento. Razon por la cual se consideró agregar indicadores de faltantes.
+El análisis dio lugar a varias decisiones de preprocesamiento. En primer lugar, \texttt{EventId}, \texttt{Weight} y \texttt{Label} deben mantenerse fuera de la matriz de entrada \texttt{X}. En segundo lugar, el valor \texttt{-999} debe reemplazarse por \texttt{NaN} antes de aplicar transformaciones. Y que no conviene eliminar columnas por tener muchos faltantes, ya que estos contienen información estructural sobre el evento. Razón por la cual se consideró agregar indicadores de faltantes.
 
 Y por otro lado, el análisis justifica dos acciones, tratar \texttt{PRI\_jet\_num} como categórica y construir variables físicas derivadas, como razones entre momentos, diferencias angulares y relaciones asociadas a jets.
 
@@ -141,21 +141,93 @@ Esta validación permitió decidir la línea principal del trabajo. Aunque la di
 
 \section{Ajuste de hiperparámetros y regularización}
 \subsection{Búsqueda incremental de hiperparámetros}
+Luego de seleccionar \texttt{P04} + XGBoost como línea principal, se realizó un ajuste progresivo del modelo. En lugar de ejecutar una búsqueda masiva sobre todos los hiperparámetros, se modificaron pocos parámetros por etapa. Esto permitió interpretar mejor qué cambios aportaban mejoras reales y cuáles no justificaban continuar.
+
+La búsqueda mantuvo la validación cruzada de 5 folds como criterio de comparación. Primero se ajustaron \texttt{learning\_rate} y \texttt{n\_estimators}, ya que controlan el compromiso entre tamaño del ensamble, capacidad y costo computacional. La mejor configuración de esta etapa fue \texttt{learning\_rate = 0.03} con \texttt{n\_estimators = 800}, alcanzando un AMS medio de 1.6317 frente al 1.6210 del modelo base.
+
+Luego se probaron modificaciones en \texttt{max\_depth} y \texttt{min\_child\_weight}. Las configuraciones más restringidas no superaron al modelo anterior, lo que sugirió que reducir demasiado la capacidad de los árboles perjudicaba la métrica. Por este motivo se mantuvieron \texttt{max\_depth = 6} y \texttt{min\_child\_weight = 1}. También se evaluaron distintas combinaciones de \texttt{subsample} y \texttt{colsample\_bytree}; la configuración \texttt{0.9/0.9} se mantuvo como la más adecuada.
+
+La evolución de la métrica durante las etapas principales se muestra en la Figura~\ref{fig:evolucion-tuning-xgboost}. La mejora fue gradual al ajustar tamaño del ensamble y regularización, pero el salto más importante apareció al incorporar pesos de entrenamiento.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.78\textwidth]{img/fig_5_1_evolucion_tuning_xgboost.png}
+    \caption{Evolución del AMS medio durante el ajuste incremental de XGBoost sobre \texttt{P04}.}
+    \label{fig:evolucion-tuning-xgboost}
+\end{figure}
 
 \subsection{Regularización del modelo}
+La regularización se abordó en varias formas. En primer lugar, se probó controlar la complejidad estructural de los árboles mediante \texttt{max\_depth} y \texttt{min\_child\_weight}. Sin embargo, las alternativas más conservadoras no mejoraron el AMS. Esto indicó que el modelo necesitaba conservar suficiente capacidad para representar interacciones no lineales entre variables físicas.
+
+En segundo lugar, se evaluó regularización por muestreo con \texttt{subsample} y \texttt{colsample\_bytree}. La intención fue reducir varianza entrenando cada árbol con subconjuntos de filas y columnas. Las pruebas no mostraron una mejora clara al usar muestreos más agresivos, por lo que se mantuvo \texttt{subsample = 0.9} y \texttt{colsample\_bytree = 0.9}.
+
+Finalmente se ajustaron las penalizaciones explícitas \texttt{reg\_alpha} y \texttt{reg\_lambda}, asociadas a regularización L1 y L2. Sin usar pesos de entrenamiento, una regularización L1 suave, con \texttt{reg\_alpha = 0.1} y \texttt{reg\_lambda = 1.0}, elevó el AMS medio a 1.6357. La mejora fue pequeña, pero confirmó que cierta penalización ayudaba a controlar el modelo sin reducir su estructura.
 
 \subsection{Uso de \texttt{sample\_weight}}
+Una decisión importante fue distinguir entre usar \texttt{Weight} como variable predictora y usarlo como peso de entrenamiento. En todos los experimentos, \texttt{Weight} se mantuvo fuera de la matriz de entrada \texttt{X}. Primero se utilizó únicamente para calcular AMS en validación, luego se evaluó su uso como \texttt{sample\_weight} durante el ajuste del modelo.
+
+Esta modificación alineó mejor el entrenamiento con la métrica del desafío, ya que AMS pondera los eventos de acuerdo con su peso. El efecto fue claro, la mejor configuración sin pesos alcanzaba un AMS medio de 1.6357, mientras que al usar \texttt{sample\_weight} el AMS subió a 1.6640. Luego, con un refinamiento local de regularización, se obtuvo la configuración \texttt{SW04}, con \texttt{reg\_alpha = 0.5} y \texttt{reg\_lambda = 2.0}, que alcanzó un AMS medio de 1.6709.
 
 \subsection{Configuración final de XGBoost}
+La configuración final del modelo quedó fijada antes de estudiar la política de decisión. Se utilizó el pipeline \texttt{P04}, XGBoost con objetivo \texttt{binary:logistic}, \texttt{tree\_method = hist}, \texttt{learning\_rate = 0.03}, \texttt{n\_estimators = 800}, \texttt{max\_depth = 6}, \texttt{min\_child\_weight = 1}, \texttt{subsample = 0.9}, \texttt{colsample\_bytree = 0.9}, \texttt{reg\_alpha = 0.5} y \texttt{reg\_lambda = 2.0}. El entrenamiento se realizó usando \texttt{Weight} como \texttt{sample\_weight}.
+
+Con esta configuración, el modelo obtuvo en validación cruzada un AMS medio de 1.6709, con desvío estándar 0.0784, y un AUC medio de 0.8983. Además, los umbrales óptimos por fold quedaron en una zona baja, con mediana cercana a 0.0541, y una proporción media de eventos clasificados como señal de aproximadamente 15.4\%.
+
+Esta configuración se tomó como modelo final interno para generar scores. La etapa siguiente consistió en decidir cómo transformar esos scores continuos en etiquetas \texttt{s}/\texttt{b}, es decir, seleccionar el punto de trabajo del clasificador.
 
 \section{Selección del punto de trabajo y submission final}
 \subsection{Scores y política de decisión}
+Una vez fijado el modelo, todavía quedaba una decisión importante, cómo transformar los scores continuos en etiquetas finales. XGBoost devuelve para cada evento un score asociado a la clase \texttt{s}, pero la métrica AMS depende de cuáles eventos se seleccionan finalmente como señal.
+
+Se estudiaron varias políticas de decisión como umbrales óptimos por fold, promedio o mediana de esos umbrales, un umbral óptimo global sobre scores out-of-fold y reglas basadas en seleccionar un porcentaje fijo de eventos con mayor score.
+
+La motivación de las políticas por porcentaje fue reducir la dependencia respecto al valor absoluto del score. En particular, luego de incorporar \texttt{sample\_weight}, la escala de los scores cambió de forma importante. En ese contexto, utilizar el ranking del modelo resultaba una alternativa más robusta que depender únicamente de una calibración absoluta.
 
 \subsection{Análisis OOF del threshold}
+Para estudiar las políticas de decisión sin usar el conjunto de test, se generaron scores out-of-fold del modelo final. Es decir, cada evento del conjunto de entrenamiento recibió un score producido por un modelo que no había sido entrenado con ese evento. Para cada fila se guardó la etiqueta real, el peso, el score, el identificador del evento y el fold correspondiente.
+
+La Tabla~\ref{tab:politicas-oof} resume las principales políticas evaluadas. El umbral óptimo global sobre los scores OOF obtuvo el mejor AMS, pero la política de clasificar como señal el 14\% de eventos con mayor score quedó prácticamente empatada. Dado que la diferencia era mínima, se prefirió inicialmente la regla basada en porcentaje por depender del ranking y no del valor absoluto del score.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{@{}p{0.34\textwidth} r r r r r@{}}
+        \toprule
+        Política & AMS OOF & Signal \% & Precisión & Recall & F1 \\
+        \midrule
+        Threshold óptimo global OOF & 3.6986 & 14.00 & 0.9210 & 0.3763 & 0.5343 \\
+        Top 14\% signal & 3.6979 & 14.00 & 0.9210 & 0.3763 & 0.5343 \\
+        Top 15\% signal & 3.6817 & 15.00 & 0.9138 & 0.4000 & 0.5564 \\
+        Media thresholds fold & 3.6787 & 15.20 & 0.9123 & 0.4047 & 0.5606 \\
+        Mediana thresholds fold & 3.6782 & 15.28 & 0.9119 & 0.4067 & 0.5625 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Comparación de políticas de decisión sobre scores out-of-fold.}
+    \label{tab:politicas-oof}
+\end{table}
 
 \subsection{Evaluación en Kaggle y ajuste del porcentaje}
+Luego del análisis OOF se realizaron submissions controladas para evaluar el comportamiento en Kaggle. Primero se comparó el umbral óptimo global OOF contra la regla top 14\%. La política top 14\% obtuvo mejor resultado público y prácticamente el mismo resultado privado, por lo que se continuó con reglas basadas en porcentaje.
+
+También se compararon dos formas de generar scores para el conjunto de test. La primera consistió en entrenar un único modelo con todos los datos disponibles. La segunda fue un ensamble de los cinco modelos de la validación cruzada, promediando sus scores sobre test. Esta segunda estrategia buscaba estabilizar el ranking final de eventos.
+
+El ajuste del porcentaje mostró que el leaderboard público favorecía seleccionar una proporción mayor de eventos como señal que la sugerida inicialmente por OOF. Para el modelo entrenado con todos los datos, el mejor resultado público se obtuvo con top 15.0\%. Para el ensamble de validación cruzada, el mejor resultado público se alcanzó con top 15.75\%. La Figura~\ref{fig:kaggle-porcentaje-cv} muestra esta sensibilidad para el caso del ensamble.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.78\textwidth]{img/fig_6_1_kaggle_porcentaje_cv_ensemble.png}
+    \caption{Resultados Public y Private en Kaggle al variar el porcentaje de eventos clasificados como señal usando el ensamble de validación cruzada.}
+    \label{fig:kaggle-porcentaje-cv}
+\end{figure}
+
+La figura también muestra una tensión entre ambas particiones de Kaggle. El mejor resultado público se obtuvo con top 15.75\%, mientras que el mejor resultado privado observado correspondió al top 14.0\%. Por lo tanto, el ajuste final del porcentaje debe interpretarse como una decisión operativa guiada por el leaderboard público, no como una garantía de mejor generalización.
 
 \subsection{Submission final}
+La submission final seleccionada utilizó el pipeline \texttt{P04}, el modelo XGBoost ajustado en la sección anterior y un ensamble de 5 modelos entrenados sobre los folds de validación cruzada. Para cada evento de test se promediaron los scores de los cinco modelos. Luego se ordenaron los eventos por score y se clasificó como \texttt{s} el 15.75\% con mayor score, dejando el resto como \texttt{b}.
+
+Con esta política se obtuvo un score público de 3.6673 y un score privado de 3.6594. Como referencia, la variante con top 14.0\% obtuvo el mejor score privado observado, 3.6892, aunque con menor score público. Esta diferencia refuerza que la política de decisión tiene un impacto importante incluso cuando el modelo y el preprocesamiento se mantienen fijos.
+
+El código final entregable se dejó en el notebook \texttt{pipeline\_final\_taller\_1.ipynb}. Este notebook parte de los archivos raw, reconstruye el preprocesamiento, entrena el ensamble, genera los scores y produce el archivo \texttt{pipeline\_final\_taller\_1.csv}. De esta forma, la solución final puede ejecutarse nuevamente sobre los datos de test sin depender de artefactos intermedios generados manualmente.
 
 \section{Conclusiones}
 
