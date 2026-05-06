@@ -7,3 +7,8 @@ data/
 keys/
 results/
 models/
+
+*.fls
+*.fdb_latexmk
+*.aux
+*.log
