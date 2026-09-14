@@ -1,6 +1,6 @@
 # Formato de submission para Kaggle: Higgs Boson
 
-Este documento deja registrado el formato del archivo de submission que usamos en el notebook [NN_extendido.ipynb](/home/santig14/fing/taa/1_TallerAA/5.%20Experimentacion%20NN/NN_extendido.ipynb) para la competencia `higgs-boson`.
+Este documento deja registrado el formato del archivo de submission que usamos en el notebook [NN_extendido.ipynb](../experimentos/5.%20Experimentacion%20NN/NN_extendido.ipynb) para la competencia `higgs-boson`.
 
 ## Estructura del CSV
 
@@ -65,6 +65,6 @@ Notas:
 
 ## Ubicaciones relevantes
 
-- Notebook que genera el submission: [NN_extendido.ipynb](/home/santig14/fing/taa/1_TallerAA/5.%20Experimentacion%20NN/NN_extendido.ipynb)
+- Notebook que genera el submission: [NN_extendido.ipynb](../experimentos/5.%20Experimentacion%20NN/NN_extendido.ipynb)
 - Archivo de ejemplo de la competencia: `data/higgs-boson/random_submission.csv`
 - Credenciales locales de Kaggle: `keys/kaggle.json`

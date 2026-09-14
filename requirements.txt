@@ -1,0 +1,12 @@
+jupyter
+numpy
+pandas
+scikit-learn
+xgboost
+matplotlib
+seaborn
+shap
+joblib
+kaggle
+comet-ml
+tensorflow

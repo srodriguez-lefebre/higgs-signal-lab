@@ -1,4 +1,8 @@
 __pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+.env
 
 AGENTS.md
 .codex
@@ -7,6 +11,11 @@ data/
 keys/
 results/
 models/
+*.zip
+kaggle.json
+*.joblib
+*.pkl
+*.keras
 
 *.fls
 *.fdb_latexmk
